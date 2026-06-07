@@ -1,9 +1,9 @@
 {
   "name": "beaconhq",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "private": false,
   "type": "module",
-  "description": "Beacon Node.js client SDK — buffer per-request telemetry and ship it to the Beacon ingest API. Includes Express, Fastify, Koa, NestJS, and Hono middleware.",
+  "description": "Beacon Node.js client SDK — buffer per-request telemetry and ship it to the Beacon ingest API. Includes Express, Fastify, Koa, NestJS, and Hono middleware, plus BullMQ cron/heartbeat monitoring.",
   "license": "MIT",
   "author": "Skyware LLC",
   "homepage": "https://beacon.skyware.dev",
@@ -26,7 +26,10 @@
     "koa",
     "nestjs",
     "hono",
-    "middleware"
+    "middleware",
+    "bullmq",
+    "cron",
+    "heartbeat"
   ],
   "main": "dist/index.js",
   "module": "dist/index.js",
@@ -35,6 +38,10 @@
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
+    },
+    "./bullmq": {
+      "types": "./dist/bullmq.d.ts",
+      "import": "./dist/bullmq.js"
     }
   },
   "files": ["dist", "README.md", "LICENSE"],
@@ -53,7 +60,8 @@
     "koa": ">=2",
     "@koa/router": ">=10",
     "@nestjs/common": ">=9",
-    "rxjs": ">=7"
+    "rxjs": ">=7",
+    "bullmq": ">=5"
   },
   "peerDependenciesMeta": {
     "express": { "optional": true },
@@ -62,7 +70,8 @@
     "koa": { "optional": true },
     "@koa/router": { "optional": true },
     "@nestjs/common": { "optional": true },
-    "rxjs": { "optional": true }
+    "rxjs": { "optional": true },
+    "bullmq": { "optional": true }
   },
   "devDependencies": {
     "@koa/router": "^13.0.0",
@@ -70,6 +79,7 @@
     "@types/koa": "^2.15.0",
     "@types/koa__router": "^12.0.4",
     "@types/node": "^22.0.0",
+    "bullmq": "^5.78.0",
     "express": "^5.1.0",
     "fastify": "^5.2.0",
     "hono": "^4.6.14",

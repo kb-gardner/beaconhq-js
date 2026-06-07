@@ -253,6 +253,65 @@ Captured payloads are stored separately from metrics and pruned on a short
 retention window (~15 days). Same flags exist on every adapter (Express, Hono,
 Fastify, Koa; Nest captures headers + request body).
 
+## Cron / job monitoring (BullMQ)
+
+If you run background jobs on [BullMQ](https://docs.bullmq.io/), Beacon can monitor
+them as **heartbeats** (dead-man's-switch): a job that succeeds refreshes its monitor
+(with the run duration); a job that fails for good trips it fast and alerts you. One
+call wires it up.
+
+1. In the Beacon dashboard, create a **heartbeat** for the job (set its expected
+   schedule + grace). Copy the heartbeat's **ping token**.
+2. Wire your `Worker` to it:
+
+```ts
+import { Worker } from 'bullmq';
+import { beaconBullMQ } from 'beaconhq/bullmq';
+
+const worker = new Worker('emails', processor, { connection });
+
+const detach = beaconBullMQ(worker, {
+  heartbeats: {
+    'send-digest': process.env.BEACON_DIGEST_TOKEN!, // job name -> ping token
+  },
+});
+
+// On shutdown, if you want to stop reporting: detach();
+```
+
+On each `completed` event the helper pings `status: 'success'` with `duration_ms`
+(`finishedOn - processedOn`). On a **terminal** `failed` event it pings
+`status: 'fail'` (plus `exit_code` if your error carries a numeric `code`/`exitCode`).
+
+It is **fire-and-forget and fail-open**, by design mirroring the rest of the SDK: the
+ping is sent without blocking BullMQ's event loop, times out after `timeoutMs`
+(default 5s), and any error (Beacon down, bad token, network blip) is swallowed (or
+routed to your `onError`) — it can **never** break or delay your jobs.
+
+**No retry flapping.** By default (`onlyFinalAttempt: true`) a failure only pings on
+the *final* attempt — a job that fails attempt 1 then succeeds on a retry never trips
+the monitor.
+
+```ts
+beaconBullMQ(worker, {
+  // Map by name, or resolve dynamically:
+  resolveToken: (jobName) => tokenForJob(jobName),
+  pingOnFailure: true,     // default — ping status:'fail' on terminal failure
+  onlyFinalAttempt: true,  // default — don't ping on a retried (non-final) failure
+  source: 'workers-eu',    // default `bullmq:<hostname>:<pid>`
+  timeoutMs: 5000,         // default — ping abort timeout
+  ingestUrl: 'https://beacon.internal.example.com/v1/ingest', // self-hosted; defaults to hosted Beacon
+  onError: (err) => log.warn(err), // default: swallow
+});
+```
+
+`bullmq` is an **optional peer dependency** and the import is type-only — `beaconhq`
+adds no BullMQ runtime dependency; you keep your own `bullmq` version.
+
+> **v1 scope:** you map **one heartbeat + token per job name**. Auto-registering a
+> heartbeat per job from the SDK is on the roadmap; for now, create the heartbeat in
+> the dashboard and paste its token.
+
 ## Behavior
 
 - Events are buffered and flushed every `flushIntervalMs` or when the buffer hits
@@ -289,10 +348,12 @@ Fastify, Koa; Nest captures headers + request body).
 - `BeaconInterceptor` — NestJS interceptor: `new BeaconInterceptor(client, { consumerHeader? })`
   (or `beaconNest(client, { consumerHeader? })`).
 - `DEFAULT_INGEST_URL` — the hosted endpoint constant.
+- `beaconBullMQ(worker, { heartbeats })` — from the **`beaconhq/bullmq`** subpath;
+  wires a BullMQ `Worker` to Beacon heartbeats. Returns a `detach()`.
 
 The framework packages (`express`, `fastify`, `koa` + `@koa/router`, `@nestjs/common`
-+ `rxjs`, `hono`) are **optional peer dependencies** — install only the one(s) your
-app uses; `beaconhq` does not pull them in.
++ `rxjs`, `hono`, `bullmq`) are **optional peer dependencies** — install only the
+one(s) your app uses; `beaconhq` does not pull them in.
 
 `BeaconEvent` matches the ingest contract exactly:
 `{ ts, method, route, path, status, duration_ms, consumer?, error? }`.
