@@ -308,9 +308,58 @@ beaconBullMQ(worker, {
 `bullmq` is an **optional peer dependency** and the import is type-only — `beaconhq`
 adds no BullMQ runtime dependency; you keep your own `bullmq` version.
 
-> **v1 scope:** you map **one heartbeat + token per job name**. Auto-registering a
-> heartbeat per job from the SDK is on the roadmap; for now, create the heartbeat in
-> the dashboard and paste its token.
+### Auto-register (zero config)
+
+Skip the dashboard setup entirely. Give `beaconBullMQ` your **project ingest key**
+(the same key your `BeaconClient` uses) plus the `Queue`, and it **discovers the
+queue's repeatable jobs and creates a Beacon heartbeat per job automatically**,
+mirroring each job's schedule. Pings then go **by name** — no per-job tokens:
+
+```ts
+import { Queue, Worker } from 'bullmq';
+import { beaconBullMQ } from 'beaconhq/bullmq';
+
+const queue = new Queue('emails', { connection });
+const worker = new Worker('emails', processor, { connection });
+
+beaconBullMQ(worker, {
+  apiKey: process.env.BEACON_INGEST_KEY!,   // same key your BeaconClient uses
+  autoRegister: { queue },                  // discovers repeatable jobs -> heartbeats, pings by name
+});
+```
+
+What it does:
+
+- **Mirrors each repeatable job's schedule into a heartbeat** — a job with `every`
+  (ms) becomes an interval heartbeat (rounded up to ≥ 1s); a cron `pattern` becomes
+  a cron heartbeat (with its timezone). Jobs with no stable name or no schedule are
+  skipped (a benign note goes to `onError`). Heartbeats are tagged `managed_by:
+  'sdk:<queue>'` and **won't clobber heartbeats you created manually** in the
+  dashboard. Tune the missed-run grace with `autoRegister: { queue, graceSeconds }`
+  (default 60s).
+- **Pings by name** on `completed`/`failed`, with the same no-flapping
+  (`onlyFinalAttempt`), duration, and `exit_code` behavior as the token path.
+- **Fail-open, non-blocking.** Registration runs in the background and never blocks
+  setup; `beaconBullMQ` still returns its synchronous `detach()`. A Beacon outage,
+  a network blip, or hitting your **plan's heartbeat cap** (a `402`) never aborts the
+  worker or the other jobs — and a ping-by-name that 404s before its heartbeat has
+  been registered self-heals on the next run.
+- **Respects the plan heartbeat cap.** If you're over your plan's heartbeat limit,
+  the over-cap `ensure` is a no-op for that job (surfaced via `onError`); the rest
+  still register.
+
+Ping routing precedence: a **mapped token wins** (the v1 `heartbeats` / `resolveToken`
+path is unchanged), then **`apiKey` → ping by name**, then no-op. So you can mix —
+auto-register most jobs by name and still pin a specific job to an explicit token.
+
+> **Removing a job?** Delete its heartbeat in the dashboard. Auto-registered
+> heartbeats are not auto-disabled when you remove the underlying repeatable job, so
+> an orphaned one would keep alerting as "down". Automatic **reconcile** (the SDK
+> disabling heartbeats for jobs that no longer exist) is on the roadmap.
+
+> **v1 token map** (still fully supported): create a heartbeat in the dashboard, copy
+> its **ping token**, and map it by job name (the first BullMQ example above). Use
+> this when you want explicit per-job tokens; use auto-register for zero setup.
 
 ## Behavior
 
@@ -348,8 +397,10 @@ adds no BullMQ runtime dependency; you keep your own `bullmq` version.
 - `BeaconInterceptor` — NestJS interceptor: `new BeaconInterceptor(client, { consumerHeader? })`
   (or `beaconNest(client, { consumerHeader? })`).
 - `DEFAULT_INGEST_URL` — the hosted endpoint constant.
-- `beaconBullMQ(worker, { heartbeats })` — from the **`beaconhq/bullmq`** subpath;
-  wires a BullMQ `Worker` to Beacon heartbeats. Returns a `detach()`.
+- `beaconBullMQ(worker, opts)` — from the **`beaconhq/bullmq`** subpath; wires a
+  BullMQ `Worker` to Beacon heartbeats. Returns a synchronous `detach()`. Map tokens
+  by job name (`heartbeats` / `resolveToken`), or pass `apiKey` + `autoRegister: {
+  queue }` for zero-config discovery + ping-by-name.
 
 The framework packages (`express`, `fastify`, `koa` + `@koa/router`, `@nestjs/common`
 + `rxjs`, `hono`, `bullmq`) are **optional peer dependencies** — install only the

@@ -1,6 +1,6 @@
 {
   "name": "beaconhq",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "private": false,
   "type": "module",
   "description": "Beacon Node.js client SDK — buffer per-request telemetry and ship it to the Beacon ingest API. Includes Express, Fastify, Koa, NestJS, and Hono middleware, plus BullMQ cron/heartbeat monitoring.",

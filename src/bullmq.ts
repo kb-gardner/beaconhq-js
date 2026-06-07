@@ -19,7 +19,7 @@
 //
 // The `bullmq` import below is TYPE-ONLY — this module has no runtime dependency on
 // bullmq. bullmq is an optional peer dependency; install it only if you use this.
-import type { Worker, Job } from 'bullmq';
+import type { Worker, Job, Queue } from 'bullmq';
 import { DEFAULT_INGEST_URL } from './client.js';
 
 // `node:os` is a static import (always present in Node, the SDK's target runtime).
@@ -34,6 +34,14 @@ interface HeartbeatPingBody {
   exit_code?: number;
   source?: string;
 }
+
+/**
+ * Schedule shape for PUT /v1/heartbeats/ensure — either a fixed interval or a
+ * cron expression. Mirrored from the queue's repeatable-job definition.
+ */
+type EnsureSchedule =
+  | { kind: 'interval'; interval_seconds: number }
+  | { kind: 'cron'; cron_expr: string; timezone?: string };
 
 export interface BeaconBullMQOptions {
   /** Map of BullMQ job name -> per-heartbeat ping token. */
@@ -63,6 +71,23 @@ export interface BeaconBullMQOptions {
   timeoutMs?: number;
   /** Observability hook for ping failures. Default: swallow. Never re-thrown. */
   onError?: (err: unknown) => void;
+
+  // --- new in 2b: zero-config, project-ingest-key driven ---
+  /**
+   * Project ingest key (the same key your `BeaconClient` uses). When set, jobs
+   * that have NO mapped token are pinged **by name** via
+   * `POST /v1/heartbeats/ping-by-name` (Bearer apiKey). Also required to use
+   * {@link BeaconBullMQOptions.autoRegister}.
+   */
+  apiKey?: string;
+  /**
+   * Discover the queue's repeatable jobs and ensure a Beacon heartbeat per job
+   * (schedule mirrored from BullMQ) on setup. Requires {@link apiKey}. Runs as a
+   * background, fire-and-forget, fail-open task — it never blocks setup and a
+   * failure (incl. the plan's heartbeat-cap 402) never aborts the worker or the
+   * other jobs. Pings then route **by name**.
+   */
+  autoRegister?: { queue: Queue; graceSeconds?: number };
 }
 
 /**
@@ -125,6 +150,192 @@ export async function pingHeartbeat(
 }
 
 /**
+ * Ping a heartbeat BY NAME via POST /v1/heartbeats/ping-by-name (Bearer apiKey).
+ * The project is resolved server-side from the key. Same body shape as the
+ * token ping. Resolves on success; REJECTS on a network error, a non-2xx
+ * response (incl. a 404 before the heartbeat exists — fail-open, self-heals on
+ * the next run once ensure has landed), or a timeout. Callers catch (fail-open).
+ */
+export async function pingHeartbeatByName(
+  base: string,
+  apiKey: string,
+  name: string,
+  body: HeartbeatPingBody,
+  timeoutMs: number,
+): Promise<void> {
+  const url = `${base}/v1/heartbeats/ping-by-name`;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify({ name, ...body }),
+      signal: controller.signal,
+    });
+    if (!res.ok) {
+      throw new Error(`Beacon ping-by-name responded ${res.status}`);
+    }
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * Ensure (idempotent upsert) a Beacon heartbeat via PUT /v1/heartbeats/ensure
+ * (Bearer apiKey). The body carries the name, the mirrored schedule, the grace
+ * window, and a `managed_by` marker. Resolves on success; REJECTS on a network
+ * error, a non-2xx response (incl. a 402 when over the plan heartbeat cap), or a
+ * timeout. Callers catch per-job (fail-open).
+ */
+export async function ensureHeartbeat(
+  base: string,
+  apiKey: string,
+  body: {
+    name: string;
+    schedule: EnsureSchedule;
+    grace_seconds: number;
+    managed_by: string;
+  },
+  timeoutMs: number,
+): Promise<void> {
+  const url = `${base}/v1/heartbeats/ensure`;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, {
+      method: 'PUT',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    });
+    if (!res.ok) {
+      throw new Error(`Beacon heartbeat ensure responded ${res.status}`);
+    }
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * A repeatable-job entry as returned by either `queue.getJobSchedulers()`
+ * (BullMQ v5 newer) or `queue.getRepeatableJobs()` (older v5). We read these
+ * fields defensively — both APIs expose a `name`, a millisecond `every`, and/or
+ * a cron `pattern` (older API also surfaced `cron`/`tz`).
+ */
+interface RepeatableEntry {
+  name?: string;
+  every?: number | string;
+  pattern?: string;
+  cron?: string;
+  tz?: string;
+}
+
+/**
+ * Map a repeatable-job entry to a Beacon ensure schedule.
+ * - `every` (ms) -> interval (>= 1s, rounded up).
+ * - else `pattern`/`cron` -> cron (+ optional tz).
+ * - neither -> null (caller skips it — can't monitor a scheduleless job).
+ */
+function scheduleFromEntry(entry: RepeatableEntry): EnsureSchedule | null {
+  const everyMs =
+    typeof entry.every === 'number'
+      ? entry.every
+      : typeof entry.every === 'string' && entry.every.trim() !== ''
+        ? Number(entry.every)
+        : NaN;
+  if (Number.isFinite(everyMs) && everyMs > 0) {
+    return { kind: 'interval', interval_seconds: Math.max(1, Math.ceil(everyMs / 1000)) };
+  }
+  const cronExpr = entry.pattern ?? entry.cron;
+  if (typeof cronExpr === 'string' && cronExpr.trim() !== '') {
+    return { kind: 'cron', cron_expr: cronExpr, timezone: entry.tz || undefined };
+  }
+  return null;
+}
+
+/**
+ * Discover the queue's repeatable jobs and ensure a heartbeat per job. Prefers
+ * the newer `getJobSchedulers()`; falls back to `getRepeatableJobs()` when it's
+ * absent. Fail-open PER JOB: one ensure failing (network / 402-cap) never aborts
+ * the others. The whole pass is awaited internally but kicked off un-awaited by
+ * the caller (background fire-and-forget). Every error routes to `onError`.
+ */
+async function autoRegisterHeartbeats(
+  base: string,
+  apiKey: string,
+  queue: Queue,
+  graceSeconds: number,
+  timeoutMs: number,
+  onError: (err: unknown) => void,
+): Promise<void> {
+  let entries: RepeatableEntry[];
+  try {
+    const q = queue as unknown as {
+      getJobSchedulers?: () => Promise<RepeatableEntry[]>;
+      getRepeatableJobs?: () => Promise<RepeatableEntry[]>;
+    };
+    if (typeof q.getJobSchedulers === 'function') {
+      entries = (await q.getJobSchedulers()) ?? [];
+    } else if (typeof q.getRepeatableJobs === 'function') {
+      entries = (await q.getRepeatableJobs()) ?? [];
+    } else {
+      throw new Error(
+        'BullMQ queue exposes neither getJobSchedulers() nor getRepeatableJobs()',
+      );
+    }
+  } catch (err) {
+    // Discovery itself failed — nothing to ensure. Fail-open.
+    safe(onError, err);
+    return;
+  }
+
+  const managedBy = `sdk:${queue.name}`;
+  for (const entry of entries) {
+    const name = entry?.name;
+    if (!name || typeof name !== 'string') {
+      safe(onError, new Error('beaconBullMQ: skipping repeatable job with no stable name'));
+      continue;
+    }
+    const schedule = scheduleFromEntry(entry);
+    if (!schedule) {
+      safe(
+        onError,
+        new Error(`beaconBullMQ: skipping job "${name}" — no interval/cron schedule found`),
+      );
+      continue;
+    }
+    try {
+      await ensureHeartbeat(
+        base,
+        apiKey,
+        { name, schedule, grace_seconds: graceSeconds, managed_by: managedBy },
+        timeoutMs,
+      );
+    } catch (err) {
+      // Per-job fail-open: a 402 cap or a network blip on one job must not
+      // prevent the rest from being ensured.
+      safe(onError, err);
+    }
+  }
+}
+
+/** Invoke an onError hook without letting it throw back into the caller. */
+function safe(onError: (err: unknown) => void, err: unknown): void {
+  try {
+    onError(err);
+  } catch {
+    /* an onError that itself throws must not escape */
+  }
+}
+
+/**
  * Extract a numeric process-style exit code off an error, if it carries one
  * (`code` / `exitCode` / `exitcode`). Returns undefined otherwise (the field is
  * then omitted from the ping). String codes (e.g. Node's `'ECONNREFUSED'`) are
@@ -153,6 +364,34 @@ export function beaconBullMQ(worker: Worker, opts: BeaconBullMQOptions): () => v
   const source = opts.source ?? defaultSource();
   const timeoutMs = opts.timeoutMs ?? 5_000;
   const onError = opts.onError ?? (() => {});
+  const apiKey = opts.apiKey;
+
+  // Config validation (loud, at setup). autoRegister needs the project ingest
+  // key to call PUT /v1/heartbeats/ensure — using it without `apiKey` is a
+  // programming error, so throw synchronously. (A ping-by-name without apiKey is
+  // NOT an error — it's just a no-op per the routing rules below.)
+  if (opts.autoRegister && !apiKey) {
+    throw new Error(
+      'beaconBullMQ: `autoRegister` requires `apiKey` (the project ingest key) — ' +
+        'ensure cannot register heartbeats without it.',
+    );
+  }
+
+  // Kick off auto-registration as a background, fire-and-forget task. The helper
+  // returns synchronously (back-compat with 0.3.0): we do NOT await this, so the
+  // worker is wired immediately and registration completes on its own. Any
+  // failure (incl. a 402 cap) is fail-open and routed to onError.
+  if (opts.autoRegister && apiKey) {
+    const graceSeconds = opts.autoRegister.graceSeconds ?? 60;
+    void autoRegisterHeartbeats(
+      base,
+      apiKey,
+      opts.autoRegister.queue,
+      graceSeconds,
+      timeoutMs,
+      onError,
+    ).catch((err) => safe(onError, err));
+  }
 
   /** Resolve a ping token for a job name: explicit map wins, then resolveToken. */
   function tokenFor(jobName: string | undefined): string | undefined {
@@ -162,23 +401,42 @@ export function beaconBullMQ(worker: Worker, opts: BeaconBullMQOptions): () => v
     return resolveToken?.(jobName);
   }
 
-  /** Fire a ping without blocking the emitter; route any failure to onError. */
+  /** Fire a token ping without blocking the emitter; route failure to onError. */
   function fire(token: string, body: HeartbeatPingBody): void {
     // Intentionally not awaited: the emitter returns immediately. .catch() makes
     // the floating promise safe — no unhandled rejection, no throw into BullMQ.
-    void pingHeartbeat(base, token, body, timeoutMs).catch((err) => {
-      try {
-        onError(err);
-      } catch {
-        // An onError that itself throws must not escape either. Truly fail-open.
-      }
-    });
+    void pingHeartbeat(base, token, body, timeoutMs).catch((err) => safe(onError, err));
+  }
+
+  /** Fire a ping-by-name without blocking the emitter; route failure to onError. */
+  function fireByName(name: string, body: HeartbeatPingBody): void {
+    if (!apiKey) return;
+    void pingHeartbeatByName(base, apiKey, name, body, timeoutMs).catch((err) =>
+      safe(onError, err),
+    );
+  }
+
+  /**
+   * Route a ping for a job: (1) a resolved token pings by token (v1 path,
+   * precedence preserved); (2) else with an apiKey, ping by name; (3) else
+   * no-op (unmapped, no key).
+   */
+  function route(jobName: string | undefined, body: HeartbeatPingBody): void {
+    const token = tokenFor(jobName);
+    if (token) {
+      fire(token, body);
+      return;
+    }
+    if (jobName && apiKey) {
+      fireByName(jobName, body);
+    }
   }
 
   const onCompleted = (job: Job): void => {
     try {
-      const token = tokenFor(job?.name);
-      if (!token) return;
+      // Precedence: token wins; else ping-by-name (apiKey); else no-op.
+      if (!job?.name) return;
+      if (!tokenFor(job.name) && !apiKey) return;
       const body: HeartbeatPingBody = { status: 'success', source };
       // duration_ms = finishedOn - processedOn, clamped >= 0. Omit if it can't be
       // computed sanely (e.g. either timestamp missing).
@@ -188,14 +446,10 @@ export function beaconBullMQ(worker: Worker, opts: BeaconBullMQOptions): () => v
         const d = finishedOn - processedOn;
         if (Number.isFinite(d) && d >= 0) body.duration_ms = Math.round(d);
       }
-      fire(token, body);
+      route(job.name, body);
     } catch (err) {
       // Resolving/inspecting the job must never throw into the emitter.
-      try {
-        onError(err);
-      } catch {
-        /* swallow */
-      }
+      safe(onError, err);
     }
   };
 
@@ -203,10 +457,11 @@ export function beaconBullMQ(worker: Worker, opts: BeaconBullMQOptions): () => v
     try {
       if (!pingOnFailure) return;
       // job may be undefined for some internal BullMQ failures -> nothing to map.
-      const token = tokenFor(job?.name);
-      if (!token) return;
+      // A failure can only be routed if there's a token OR an apiKey for the name.
+      if (!job?.name) return;
+      if (!tokenFor(job.name) && !apiKey) return;
 
-      if (onlyFinalAttempt && job) {
+      if (onlyFinalAttempt) {
         // Final attempt = attemptsMade has reached the configured attempts cap.
         const attemptsMade = job.attemptsMade ?? 0;
         const maxAttempts = job.opts?.attempts ?? 1;
@@ -216,13 +471,9 @@ export function beaconBullMQ(worker: Worker, opts: BeaconBullMQOptions): () => v
       const body: HeartbeatPingBody = { status: 'fail', source };
       const exitCode = extractExitCode(err);
       if (exitCode !== undefined) body.exit_code = exitCode;
-      fire(token, body);
+      route(job.name, body);
     } catch (e) {
-      try {
-        onError(e);
-      } catch {
-        /* swallow */
-      }
+      safe(onError, e);
     }
   };
 
