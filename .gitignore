@@ -1,0 +1,22 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+
+# Logs / env
+*.log
+.env
+.env.*
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+
+# Test / cache
+coverage/
+.vitest/
+
+# Internal agent context — never publish
+CLAUDE.md
